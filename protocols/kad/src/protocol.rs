@@ -36,7 +36,7 @@ use protobuf::{self, Message};
 use protobuf_structs;
 use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 use std::iter;
-use tokio_codec::Framed;
+use tokio_codec::{FramedRead, FramedWrite};
 use tokio_io::{AsyncRead, AsyncWrite};
 use unsigned_varint::codec;
 
@@ -143,50 +143,63 @@ impl UpgradeInfo for KademliaProtocolConfig {
 
 impl<C> InboundUpgrade<C> for KademliaProtocolConfig
 where
-    C: AsyncRead + AsyncWrite + 'static, // TODO: 'static :-/
+    C: AsyncRead + 'static, // TODO: 'static :-/
 {
-    type Output = KadStreamSink<C>;
+    type Output = KadStream<C>;
     type Error = IoError;
     type Future = future::FutureResult<Self::Output, Self::Error>;
 
     #[inline]
     fn upgrade_inbound(self, incoming: C, _: Self::UpgradeId) -> Self::Future {
-        future::ok(kademlia_protocol(incoming))
+        future::ok(kademlia_protocol_read(incoming))
     }
 }
 
 impl<C> OutboundUpgrade<C> for KademliaProtocolConfig
 where
-    C: AsyncRead + AsyncWrite + 'static, // TODO: 'static :-/
+    C: AsyncWrite + 'static, // TODO: 'static :-/
 {
-    type Output = KadStreamSink<C>;
+    type Output = KadSink<C>;
     type Error = IoError;
     type Future = future::FutureResult<Self::Output, Self::Error>;
 
     #[inline]
     fn upgrade_outbound(self, incoming: C, _: Self::UpgradeId) -> Self::Future {
-        future::ok(kademlia_protocol(incoming))
+        future::ok(kademlia_protocol_write(incoming))
     }
 }
 
-type KadStreamSink<S> = stream::AndThen<sink::With<stream::FromErr<Framed<S, codec::UviBytes<Vec<u8>>>, IoError>, KadMsg, fn(KadMsg) -> Result<Vec<u8>, IoError>, Result<Vec<u8>, IoError>>, fn(BytesMut) -> Result<KadMsg, IoError>, Result<KadMsg, IoError>>;
+type KadStream<S> = stream::AndThen<stream::FromErr<FramedRead<S, codec::UviBytes<Vec<u8>>>, IoError>, fn(BytesMut) -> Result<KadMsg, IoError>, Result<KadMsg, IoError>>;
 
-// Upgrades a socket to use the Kademlia protocol.
-fn kademlia_protocol<S>(socket: S) -> KadStreamSink<S>
+type KadSink<S> = sink::With<sink::SinkFromErr<FramedWrite<S, codec::UviBytes<Vec<u8>>>, IoError>, KadMsg, fn(KadMsg) -> Result<Vec<u8>, IoError>, Result<Vec<u8>, IoError>>;
+
+// Upgrades a socket to emit to the Kademlia protocol.
+fn kademlia_protocol_write<S>(s: S) -> KadSink<S>
 where
-    S: AsyncRead + AsyncWrite,
+    S: AsyncWrite,
 {
-    Framed::new(socket, codec::UviBytes::default())
-        .from_err::<IoError>()
+    FramedWrite::new(s, codec::UviBytes::default())
+        .sink_from_err::<IoError>()
         .with::<_, fn(_) -> _, _>(|request| -> Result<_, IoError> {
             let proto_struct = msg_to_proto(request);
-            Ok(proto_struct.write_to_bytes().unwrap()) // TODO: error?
+            Ok(proto_struct.write_to_bytes().expect("Well formed input only"))
         })
+}
+
+// Upgrades a socket to listen to the Kademlia protocol.
+fn kademlia_protocol_read<S>(s: S) -> KadStream<S>
+where
+    S: AsyncRead,
+{
+    FramedRead::new(s, codec::UviBytes::default())
+        .from_err::<IoError>()
         .and_then::<fn(_) -> _, _>(|bytes| {
             let response = protobuf::parse_from_bytes(&bytes)?;
             proto_to_msg(response)
         })
 }
+
+
 
 /// Message that we can send to a peer or received from a peer.
 // TODO: document the rest

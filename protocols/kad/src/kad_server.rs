@@ -77,12 +77,10 @@ impl UpgradeInfo for KadConnecConfig {
 
 impl<C> InboundUpgrade<C> for KadConnecConfig
 where
-    C: AsyncRead + AsyncWrite + Send + 'static, // TODO: 'static :-/
+    C: AsyncRead + Send + 'static, // TODO: 'static :-/
 {
-    type Output = (
-        KadConnecController,
-        Box<Stream<Item = KadIncomingRequest, Error = IoError> + Send>,
-    );
+    type Output = Box<Stream<Item = KadIncomingRequest, Error = IoError> + Send>;
+
     type Error = IoError;
     type Future = future::Map<<KademliaProtocolConfig as InboundUpgrade<C>>::Future, fn(<KademliaProtocolConfig as InboundUpgrade<C>>::Output) -> Self::Output>;
 
@@ -90,131 +88,68 @@ where
     fn upgrade_inbound(self, incoming: C, id: Self::UpgradeId) -> Self::Future {
         self.raw_proto
             .upgrade_inbound(incoming, id)
-            .map(build_from_sink_stream)
+            .map(build_from_stream)
     }
 }
 
-/// Allows sending Kademlia requests and receiving responses.
+/// Allows sending Kademlia requests, no reply expected, running in unidirectional mode.
+/// Use like a Sink.
 #[derive(Debug, Clone)]
 pub struct KadConnecController {
-    // In order to send a request, we use this sender to send a tuple. The first element of the
-    // tuple is the message to send to the remote, and the second element is what is used to
-    // receive the response. If the query doesn't expect a response (e.g. `PUT_VALUE`), then the
-    // one-shot sender will be dropped without being used.
-    inner: mpsc::UnboundedSender<(KadMsg, oneshot::Sender<KadMsg>)>,
+    inner: Box<Sink<SinkItem = protocol::KadMsg, SinkError = IoError> + Send>,
 }
 
 impl KadConnecController {
-    /// Sends a `FIND_NODE` query to the node and provides a future that will contain the response.
+
+  fn send_msg(self, msg: protocol::KadMsg) -> impl Future<Item = Self, Error = IoError > {
+    self.inner.send(msg)
+      .map_err(|_| {
+            IoError::new(
+                IoErrorKind::ConnectionAborted,
+                "connection to remote has aborted",
+            )
+ 
+      })
+    .map(|c| KadConnecController { inner: c })
+  }
+    /// Sends a `FIND_NODE` query.
     // TODO: future item could be `impl Iterator` instead
     pub fn find_node(
-        &self,
+        self,
         searched_key: &PeerId,
-    ) -> impl Future<Item = Vec<KadPeer>, Error = IoError> {
+    ) -> impl Future<Item = Self, Error = IoError> {
         let message = protocol::KadMsg::FindNodeReq {
             key: searched_key.clone().into(),
         };
-
-        let (tx, rx) = oneshot::channel();
-
-        match self.inner.unbounded_send((message, tx)) {
-            Ok(()) => (),
-            Err(_) => {
-                let fut = future::err(IoError::new(
-                    IoErrorKind::ConnectionAborted,
-                    "connection to remote has aborted",
-                ));
-
-                return future::Either::B(fut);
-            }
-        };
-
-        let future = rx.map_err(|_| {
-            IoError::new(
-                IoErrorKind::ConnectionAborted,
-                "connection to remote has aborted",
-            )
-        }).and_then(|msg| match msg {
-            KadMsg::FindNodeRes { closer_peers, .. } => Ok(closer_peers),
-            _ => Err(IoError::new(
-                IoErrorKind::InvalidData,
-                "invalid response type received from the remote",
-            )),
-        });
-
-        future::Either::A(future)
+        self.send_msg(message)
     }
 
-    /// Sends a `GET_PROVIDERS` query to the node and provides a future that will contain the response.
+    /// Sends a `GET_PROVIDERS` query to the node.
     // TODO: future item could be `impl Iterator` instead
     pub fn get_providers(
-        &self,
+        self,
         searched_key: &Multihash,
-    ) -> impl Future<Item = (Vec<KadPeer>, Vec<KadPeer>), Error = IoError> {
+    ) -> impl Future<Item = Self, Error = IoError> {
         let message = protocol::KadMsg::GetProvidersReq {
             key: searched_key.clone(),
         };
-
-        let (tx, rx) = oneshot::channel();
-
-        match self.inner.unbounded_send((message, tx)) {
-            Ok(()) => (),
-            Err(_) => {
-                let fut = future::err(IoError::new(
-                    IoErrorKind::ConnectionAborted,
-                    "connection to remote has aborted",
-                ));
-
-                return future::Either::B(fut);
-            }
-        };
-
-        let future = rx.map_err(|_| {
-            IoError::new(
-                IoErrorKind::ConnectionAborted,
-                "connection to remote has aborted",
-            )
-        }).and_then(|msg| match msg {
-            KadMsg::GetProvidersRes { closer_peers, provider_peers } => Ok((closer_peers, provider_peers)),
-            _ => Err(IoError::new(
-                IoErrorKind::InvalidData,
-                "invalid response type received from the remote",
-            )),
-        });
-
-        future::Either::A(future)
+        self.send_msg(message)
     }
 
     /// Sends an `ADD_PROVIDER` message to the node.
-    pub fn add_provider(&self, key: Multihash, provider_peer: KadPeer) -> Result<(), IoError> {
-        // Dummy channel, as the `tx` is going to be dropped anyway.
-        let (tx, _rx) = oneshot::channel();
+    pub fn add_provider(self, key: Multihash, provider_peer: KadPeer
+    ) -> impl Future<Item = Self, Error = IoError> {
         let message = protocol::KadMsg::AddProvider {
-            key,
+             key,
             provider_peer,
         };
-        match self.inner.unbounded_send((message, tx)) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(IoError::new(
-                IoErrorKind::ConnectionAborted,
-                "connection to remote has aborted",
-            )),
-        }
+        self.send_msg(message)
     }
 
-    /// Sends a `PING` query to the node. Because of the way the protocol is designed, there is
-    /// no way to differentiate between a ping and a pong. Therefore this function doesn't return a
-    /// future, and the only way to be notified of the result is through the stream.
+    /// Sends a `PING` (or `PONG`) query to the node.
     pub fn ping(&self) -> Result<(), IoError> {
-        // Dummy channel, as the `tx` is going to be dropped anyway.
-        let (tx, _rx) = oneshot::channel();
-        match self.inner.unbounded_send((protocol::KadMsg::Ping, tx)) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(IoError::new(
-                IoErrorKind::ConnectionAborted,
-                "connection to remote has aborted",
-            )),
-        }
+        let message = protocol::KadMsg::Ping;
+        self.send_msg(message)
     }
 }
 
@@ -288,8 +223,8 @@ impl KadGetProvidersRespond {
 }
 
 // Builds a controller and stream from a stream/sink of raw messages.
-fn build_from_sink_stream<'a, S>(connec: S) -> (KadConnecController, Box<Stream<Item = KadIncomingRequest, Error = IoError> + Send + 'a>)
-where S: Sink<SinkItem = KadMsg, SinkError = IoError> + Stream<Item = KadMsg, Error = IoError> + Send + 'a
+fn build_from_stream<'a, S>(connec: S) -> (KadConnecController, Box<Stream<Item = KadIncomingRequest, Error = IoError> + Send + 'a>)
+where S: Stream<Item = KadMsg, Error = IoError> + Send + 'a
 {
     let (tx, rx) = mpsc::unbounded();
     let future = kademlia_handler(connec, rx);
